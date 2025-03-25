@@ -41,8 +41,11 @@ module Run
 	#
 	# All Runner state (vars, labels, etc.) is global (cross-thread).
 	class Runner
-		# These are editable by the user
-		@user_vars = {} of String => String
+		# These are editable by the user. User vars are all String except when passed or retrieved as type Ptr
+		# to low level commands DllCall, VarSetCapacity, NumPut, and NumGet. Could also be Pointer(Void) instead of Bytes.
+		# This distinction is unfortunately necessary because writing memory to my_str.to_unsafe somehow segfaults
+		# while doing the same to a bare slice (with the same contents!) doesn't.
+		@user_vars = {} of ::String => ::String | Bytes
 		# These are only set by the program. See also `get_global_built_in_computed_var`
 		@built_in_static_vars = {
 			"a_space" => " ",
@@ -109,6 +112,7 @@ module Run
 			# TODO: does this run? as exit handlers are excluded somewhere with process.exit(0)
 			at_exit do
 				if sound_play_pid = @settings.sound_play_pid
+					# TODO: the pid isn't unset after soundplay finishes, leading to process not found error here at exit
 					Process.signal(Signal::KILL, sound_play_pid)
 				end
 			end
@@ -231,12 +235,22 @@ module Run
 		# Do not use directly, use `Thread.get_var` instead.
 		# Get the value of global values, regardless if user set or not.
 		# Case sensitive.
-		def get_global_var(var)
-			@user_vars[var]? || @built_in_static_vars[var]? || get_global_built_in_computed_var(var)
+		def get_global_var_str(var)
+			user_var = @user_vars[var.downcase]?
+			if user_var
+				return user_var.is_a?(Bytes) ? ::String.new(user_var) : user_var
+			end
+			@built_in_static_vars[var]? || get_global_built_in_computed_var(var)
+		end
+		# Case insensitive
+		def get_user_var_str(var)
+			var = @user_vars[var.downcase]?
+			return "" if ! var
+			var.is_a?(Bytes) ? ::String.new(var) : var
 		end
 		# Case insensitive
 		def get_user_var(var)
-			@user_vars[var.downcase]? || ""
+			@user_vars[var.downcase]?
 		end
 		def print_user_vars # TODO is that true / ListVars shouldnt print builtins / threadlocals like errorlevel?
 			puts @user_vars
@@ -244,20 +258,20 @@ module Run
 		# `var` is case insensitive
 		def set_user_var(var, value)
 			down = var.downcase
-			case down
-			when "clipboard"
-				display.gtk.set_clipboard(value)
-			else
+			if ! value.is_a?(Bytes)
+				case down
+				when "clipboard"
+					return display.gtk.set_clipboard(value)
+				end
 				return if @built_in_static_vars[down]? || get_global_built_in_computed_var(down)
-				{% if ! flag?(:release) %}
-					puts "[debug] set_user_var '#{var}': #{value}"
-				{% end %}
 				if value.empty?
-					@user_vars.delete down
-				else
-					@user_vars[down] = value
+					return @user_vars.delete down
 				end
 			end
+			{% if ! flag?(:release) %}
+				puts "[debug] set_user_var '#{var}': #{value}"
+			{% end %}
+			@user_vars[down] = value
 		end
 		# `var` is case insensitive
 		def set_global_built_in_static_var(var, value)
@@ -271,9 +285,9 @@ module Run
 			when "a_mm", "a_mon" then Time.local.month.to_s(precision: 2)
 			when "a_dd", "a_mday" then Time.local.day.to_s(precision: 2)
 			when "a_mmmm" then Time.local.to_s("%B")
-			when "a_mmm"  then Time.local.to_s("%b")
-			when "a_dddd"  then Time.local.to_s("%A")
-			when "a_ddd"  then Time.local.to_s("%a")
+			when "a_mmm" then Time.local.to_s("%b")
+			when "a_dddd" then Time.local.to_s("%A")
+			when "a_ddd" then Time.local.to_s("%a")
 			when "a_wday" then (Time.local.day_of_week.value % 7 + 1).to_s
 			when "a_yday" then Time.local.day_of_year.to_s
 			when "a_yweek"
@@ -289,9 +303,10 @@ module Run
 			when "a_screenwidth" then display.adapter.display.default_screen.width.to_s
 			when "a_screenheight" then display.adapter.display.default_screen.height.to_s
 			when "a_username" then Hacks.username
-			when "a_computername" then `uname -n`
+			when "a_computername" then `uname -n`.strip
 			when "a_issuspended" then @suspension ? "1" : "0"
 			when "a_iscompiled" then @is_compiled ? "1" : ""
+			# TODO: this doesn't consider mouse movement
 			when "a_timeidle" then (Time.monotonic - display.last_event_received).total_milliseconds.round.to_i.to_s
 			when "a_language" then Util::LcidMapping.mapping[ENV["LANG"].split('.')[0]]? || ""
 			when "a_desktop" then `xdg-user-dir DESKTOP`.strip
@@ -327,9 +342,9 @@ module Run
 			lock = File.open(lock_path, "a+")
 			begin
 				lock.flock_exclusive(blocking: false)
-      		rescue e
-        		already_running_pid = lock.gets_to_end.to_i
-    		end
+			rescue e
+				already_running_pid = lock.gets_to_end.to_i
+			end
 			if already_running_pid > -1
 				case @settings.single_instance
 				when SingleInstance::Force
